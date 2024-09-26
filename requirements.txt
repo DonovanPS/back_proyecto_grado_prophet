@@ -4,3 +4,4 @@ prophet
 boto3
 python-dotenv
 pydantic
+uvicorn
