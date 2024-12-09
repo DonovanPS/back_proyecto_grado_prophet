@@ -180,4 +180,5 @@ def top_correlated(request: CorrelationRequest):
     return {
         "description": description,
         "top_correlated_medications": top_medications
+        
     }
