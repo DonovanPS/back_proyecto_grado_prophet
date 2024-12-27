@@ -2,7 +2,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-from prophet import Prophet
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+
 from io import BytesIO
 import boto3
 import os
@@ -102,15 +105,16 @@ def get_top_correlated_medications(medication_name, corr_matrix, top_n=5):
 
 
 
+import numpy as np
+
 @app.post("/predict")
 def predict(request: PredictRequest):
-    # Obtener los valores del cuerpo de la solicitud
     folder_name = request.folder_name
     file_name = request.file_name
     description = request.description
     periods = request.periods
 
-    # Obtener el archivo de Excel desde el bucket de S3
+    # Obtener el archivo de Excel desde S3
     df = get_excel_file_from_s3(folder_name, file_name)
 
     # Transformar los datos
@@ -119,26 +123,55 @@ def predict(request: PredictRequest):
 
     # Filtrar por el medicamento específico
     df_filtered = df_melted[df_melted["DESCRIPCION"] == description].copy()
-    df_filtered = df_filtered[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
-
     if df_filtered.empty:
         raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
 
-    # Inicializar y ajustar el modelo con los datos de entrenamiento
-    model = Prophet()
-    model.fit(df_filtered)
+    df_filtered = df_filtered[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
 
-    # Hacer una predicción para los próximos 'periods' meses
-    future = model.make_future_dataframe(periods=periods, freq='MS')
-    forecast = model.predict(future)
+    # Crear características para XGBoost
+    df_filtered['month'] = df_filtered['ds'].dt.month
+    df_filtered['year'] = df_filtered['ds'].dt.year
 
-    # Convertir los datos históricos y las predicciones a un formato dict para la respuesta JSON
+    # Dividir datos en conjunto de entrenamiento y prueba
+    X = df_filtered[['month', 'year']]
+    y = df_filtered['y']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Entrenar el modelo XGBoost
+    model = XGBRegressor(objective='reg:squarederror', n_estimators=100)
+    model.fit(X_train, y_train)
+
+    # Predecir en el conjunto de prueba
+    y_pred = model.predict(X_test)
+
+    # Calcular RMSE manualmente
+    rmse = np.sqrt(((y_test - y_pred) ** 2).mean())  # Fórmula manual de RMSE
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    # Predecir los próximos 'periods' meses
+    last_date = df_filtered['ds'].max()
+    future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=periods, freq='M')
+    future_df = pd.DataFrame({'ds': future_dates})
+    future_df['month'] = future_df['ds'].dt.month
+    future_df['year'] = future_df['ds'].dt.year
+
+    # Hacer predicciones para los meses futuros
+    future_df['y_pred'] = model.predict(future_df[['month', 'year']])
+
+    # Convertir datos históricos y predicciones a formato dict para la respuesta
     historical_data = df_filtered.to_dict(orient="records")
-    predictions = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_dict(orient="records")
+    predictions = future_df[['ds', 'y_pred']].rename(columns={'y_pred': 'yhat'}).to_dict(orient="records")
 
     return {
         "historical_data": historical_data,
-        "predictions": predictions
+        "predictions": predictions,
+        "metrics": {
+            "rmse": rmse,
+            "mae": mae,
+            "r2": r2
+        },
+        "model": "XGBoost"
     }
 
 
@@ -180,4 +213,5 @@ def top_correlated(request: CorrelationRequest):
     return {
         "description": description,
         "top_correlated_medications": top_medications
+
     }
