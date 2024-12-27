@@ -138,7 +138,8 @@ def predict(request: PredictRequest):
 
     return {
         "historical_data": historical_data,
-        "predictions": predictions
+        "predictions": predictions,
+        "model": "Prop"
     }
 
 
