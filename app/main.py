@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-from prophet import Prophet
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 from io import BytesIO
 import boto3
 import os
@@ -104,13 +104,12 @@ def get_top_correlated_medications(medication_name, corr_matrix, top_n=5):
 
 @app.post("/predict")
 def predict(request: PredictRequest):
-    # Obtener los valores del cuerpo de la solicitud
     folder_name = request.folder_name
     file_name = request.file_name
     description = request.description
     periods = request.periods
 
-    # Obtener el archivo de Excel desde el bucket de S3
+    # Obtener el archivo de Excel desde S3
     df = get_excel_file_from_s3(folder_name, file_name)
 
     # Transformar los datos
@@ -119,26 +118,43 @@ def predict(request: PredictRequest):
 
     # Filtrar por el medicamento específico
     df_filtered = df_melted[df_melted["DESCRIPCION"] == description].copy()
-    df_filtered = df_filtered[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
-
     if df_filtered.empty:
         raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
 
-    # Inicializar y ajustar el modelo con los datos de entrenamiento
-    model = Prophet()
-    model.fit(df_filtered)
+    # Preparar los datos para SARIMAX
+    df_filtered.set_index("Fecha", inplace=True)
+    df_filtered = df_filtered.sort_index()
+    df_filtered["Valor"] = pd.to_numeric(df_filtered["Valor"], errors='coerce')
+    df_filtered.dropna(inplace=True)
 
-    # Hacer una predicción para los próximos 'periods' meses
-    future = model.make_future_dataframe(periods=periods, freq='MS')
-    forecast = model.predict(future)
+    # Dividir los datos en entrenamiento y prueba (opcional, para validación interna)
+    train_size = int(len(df_filtered) * 0.8)
+    train, test = df_filtered[:train_size], df_filtered[train_size:]
 
-    # Convertir los datos históricos y las predicciones a un formato dict para la respuesta JSON
-    historical_data = df_filtered.to_dict(orient="records")
-    predictions = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_dict(orient="records")
+    # Ajustar el modelo SARIMAX
+    try:
+        model = SARIMAX(train["Valor"],
+                        order=(1, 1, 1),  # Cambiar según la naturaleza de tus datos
+                        seasonal_order=(1, 1, 1, 12),  # Estacionalidad anual (12 meses)
+                        enforce_stationarity=False,
+                        enforce_invertibility=False)
+        sarima_model = model.fit(disp=False)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al ajustar el modelo SARIMAX: {str(e)}")
+
+    # Generar predicciones para los próximos 'periods' meses
+    last_date = df_filtered.index.max()
+    future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=periods, freq='M')
+    forecast = sarima_model.forecast(steps=periods)
+
+    # Preparar la respuesta
+    historical_data = df_filtered.reset_index().rename(columns={"Fecha": "ds", "Valor": "y"}).to_dict(orient="records")
+    predictions = [{"ds": date, "yhat": pred} for date, pred in zip(future_dates, forecast)]
 
     return {
         "historical_data": historical_data,
-        "predictions": predictions
+        "predictions": predictions,
+        "model": "Sari"
     }
 
 
@@ -180,4 +196,5 @@ def top_correlated(request: CorrelationRequest):
     return {
         "description": description,
         "top_correlated_medications": top_medications
+
     }
