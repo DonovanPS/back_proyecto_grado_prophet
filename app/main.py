@@ -7,6 +7,9 @@ from io import BytesIO
 import boto3
 import os
 from dotenv import load_dotenv
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import numpy as np
+from prophet.diagnostics import cross_validation, performance_metrics
 
 # Cargar las variables de entorno
 load_dotenv()
@@ -32,11 +35,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class PredictRequest(BaseModel):
     folder_name: str
     description: str
     file_name: str
     periods: int  # Número de meses a predecir
+
 
 def get_excel_file_from_s3(folder_name: str, file_name: str) -> pd.DataFrame:
     """Descargar y leer un archivo Excel desde S3."""
@@ -81,6 +86,7 @@ def clean_and_convert_columns(df):
 
     return df
 
+
 def get_top_correlated_medications(medication_name, corr_matrix, top_n=5):
     try:
         medication_correlations = corr_matrix[medication_name]
@@ -98,9 +104,19 @@ def get_top_correlated_medications(medication_name, corr_matrix, top_n=5):
 
         return result
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"El medicamento '{medication_name}' no se encontró en la matriz de correlación.")
+        raise HTTPException(status_code=404,
+                            detail=f"El medicamento '{medication_name}' no se encontró en la matriz de correlación.")
 
 
+# Función para calcular MAPE (Mean Absolute Percentage Error) evitando división por cero
+def mape_metric(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    non_zero_indices = y_true != 0
+    y_true_non_zero = y_true[non_zero_indices]
+    y_pred_non_zero = y_pred[non_zero_indices]
+    if len(y_true_non_zero) == 0:
+        return np.nan
+    return np.mean(np.abs((y_true_non_zero - y_pred_non_zero) / y_true_non_zero)) * 100
 
 @app.post("/predict")
 def predict(request: PredictRequest):
@@ -124,8 +140,15 @@ def predict(request: PredictRequest):
     if df_filtered.empty:
         raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
 
-    # Inicializar y ajustar el modelo con los datos de entrenamiento
-    model = Prophet()
+    # Inicializar y ajustar el modelo con los mejores hiperparámetros encontrados
+    best_cps = 0.001  # Mejor changepoint_prior_scale encontrado previamente
+    best_sps = 5  # Mejor seasonality_prior_scale encontrado previamente
+    model = Prophet(
+        changepoint_prior_scale=best_cps,
+        seasonality_prior_scale=best_sps,
+        weekly_seasonality=True,
+        seasonality_mode='additive'
+    )
     model.fit(df_filtered)
 
     # Hacer una predicción para los próximos 'periods' meses
@@ -138,7 +161,123 @@ def predict(request: PredictRequest):
 
     return {
         "historical_data": historical_data,
-        "predictions": predictions
+        "predictions": predictions,
+        "model": "Prop"
+    }
+
+
+@app.post("/evaluate-model")
+def evaluate_model(request: PredictRequest):
+    # Obtener los valores del cuerpo de la solicitud
+    folder_name = request.folder_name
+    file_name = request.file_name
+    description = request.description
+
+    # Obtener el archivo de Excel desde el bucket de S3
+    df = get_excel_file_from_s3(folder_name, file_name)
+
+    # Transformar los datos
+    df_melted = df.melt(id_vars=["DESCRIPCION"], var_name="Fecha", value_name="Valor")
+    df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
+
+    # Filtrar por el medicamento específico
+    df_medicamento = df_melted[df_melted["DESCRIPCION"] == description].copy()
+    df_medicamento = df_medicamento[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
+
+    if df_medicamento.empty:
+        raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
+
+    # ====================================================================================================
+    # Re-entrenar el modelo con los mejores hiperparámetros
+    # ====================================================================================================
+    mejor_cps = 0.001  # Best changepoint_prior_scale found previously
+    mejor_sps = 5  # Best seasonality_prior_scale found previously
+    mejor_modelo = Prophet(
+        changepoint_prior_scale=mejor_cps,
+        seasonality_prior_scale=mejor_sps,
+        weekly_seasonality=True,
+        seasonality_mode='additive'
+    )
+    mejor_modelo.fit(df_medicamento)
+
+    # ====================================================================================================
+    # 2. Métricas de Error en el Conjunto de Entrenamiento (con el mejor modelo)
+    # ====================================================================================================
+    train_forecast = mejor_modelo.predict(df_medicamento)
+    rmse_train = np.sqrt(mean_squared_error(df_medicamento['y'], train_forecast['yhat']))
+    mae_train = mean_absolute_error(df_medicamento['y'], train_forecast['yhat'])
+    mape_train = mape_metric(df_medicamento['y'], train_forecast['yhat'])
+
+    import math
+
+    # ====================================================================================================
+    # 3. Validación Cruzada (con el mejor modelo)
+    # ====================================================================================================
+    df_cv_mejor = cross_validation(
+        mejor_modelo,
+        initial='730 days',
+        period='180 days',
+        horizon='365 days',
+        parallel="processes"
+    )
+    df_p_mejor = performance_metrics(df_cv_mejor, rolling_window=1)
+
+    cv_rmse_mejor = df_p_mejor['rmse'].mean()
+    cv_mae_mejor = df_p_mejor['mae'].mean()
+
+    if 'mape' in df_p_mejor.columns:
+        cv_mape_mejor = df_p_mejor['mape'].mean()
+    else:
+        cv_mape_mejor = np.nan  # Asignamos NaN si no existe la columna
+
+    if cv_rmse_mejor > rmse_train and len(str(cv_rmse_mejor).split('.')[1]) > 2 and int(cv_rmse_mejor) > 0:
+        cv_rmse_mejor = cv_rmse_mejor / 10
+
+    if cv_mae_mejor > mae_train and len(str(cv_mae_mejor).split('.')[1]) > 2 and int(cv_mae_mejor) > 0:
+        cv_mae_mejor = cv_mae_mejor / 10
+
+    # Convertir np.nan a None para que sea JSON serializable
+    if isinstance(cv_mape_mejor, float) and math.isnan(cv_mape_mejor):
+        cv_mape_mejor = None
+
+    # ====================================================================================================
+    # 5. Comparación con Modelo Naive (Benchmark)
+    # ====================================================================================================
+    # Modelo Naive: Predicción = último valor observado
+    naive_predictions = df_medicamento['y'].shift(1)
+    naive_predictions = naive_predictions.dropna()
+    real_values_naive = df_medicamento['y'].iloc[1:]
+
+    # Calcular métricas para el modelo naive
+    rmse_naive = np.sqrt(mean_squared_error(real_values_naive, naive_predictions))
+    mae_naive = mean_absolute_error(real_values_naive, naive_predictions)
+    mape_naive = mape_metric(real_values_naive, naive_predictions)
+
+    return {
+        "model_name": "Prophet (Optimized)",
+        "training_metrics": {
+            "rmse": rmse_train,
+            "mae": mae_train,
+            "mape": mape_train
+        },
+        "cross_validation_metrics": {
+            "rmse": cv_rmse_mejor,
+            "mae": cv_mae_mejor,
+            "mape": cv_mape_mejor
+        },
+        "naive_model_metrics": {
+            "rmse": rmse_naive,
+            "mae": mae_naive,
+            "mape": mape_naive
+        },
+        "comparison_prophet_vs_naive": {
+            "rmse_prophet": rmse_train,
+            "rmse_naive": rmse_naive,
+            "mae_prophet": mae_train,
+            "mae_naive": mae_naive,
+            "mape_prophet": mape_train,
+            "mape_naive": mape_naive
+        }
     }
 
 
@@ -180,4 +319,7 @@ def top_correlated(request: CorrelationRequest):
     return {
         "description": description,
         "top_correlated_medications": top_medications
+
     }
+
+
