@@ -118,7 +118,6 @@ def mape_metric(y_true, y_pred):
         return np.nan
     return np.mean(np.abs((y_true_non_zero - y_pred_non_zero) / y_true_non_zero)) * 100
 
-
 @app.post("/predict")
 def predict(request: PredictRequest):
     # Obtener los valores del cuerpo de la solicitud
